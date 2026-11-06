@@ -1057,6 +1057,8 @@ fn convert_to_dng_is_verified_and_atomic() {
     }
     assert_eq!(names(), ["shot.dng"], "no partial DNG");
     assert_eq!(s.catalog.photo(id).unwrap().source, lightcraft_catalog::Source::File { path: path.clone() }, "not relinked");
+    let original_size = s.catalog.photo(id).unwrap().file_size;
+    assert_eq!(s.catalog.photo(copy_id).unwrap().file_size, original_size);
     // a good conversion: a new name (the existing file is not replaced), decodable, relinked
     let r = s.execute("photo.convertToDng", &json!({})).unwrap();
     let out = r["converted"][0]["path"].as_str().unwrap().to_string();
@@ -1065,10 +1067,25 @@ fn convert_to_dng_is_verified_and_atomic() {
     let back = lightcraft_raw::decode(&std::fs::read(&out).unwrap()).unwrap();
     assert_eq!(back.data, lightcraft_raw::decode(&bytes).unwrap().data);
     let converted_size = std::fs::metadata(&out).unwrap().len();
+    assert_ne!(original_size, converted_size, "the fixture must expose a stale catalog size");
     assert_eq!(s.catalog.photo(id).unwrap().file_size, converted_size);
     assert_eq!(s.catalog.photo(copy_id).unwrap().file_size, converted_size, "virtual copies share the converted file");
     assert_eq!(s.catalog.photo(copy_id).unwrap().source, lightcraft_catalog::Source::File { path: out.clone() });
-    assert_eq!(s.catalog.photo(id).unwrap().source, lightcraft_catalog::Source::File { path: out });
+    assert_eq!(s.catalog.photo(id).unwrap().source, lightcraft_catalog::Source::File { path: out.clone() });
+    s.execute("edit.undo", &json!({})).unwrap();
+    for photo_id in [id, copy_id] {
+        let photo = s.catalog.photo(photo_id).unwrap();
+        assert_eq!(photo.source, lightcraft_catalog::Source::File { path: path.clone() });
+        assert_eq!(photo.file_size, original_size);
+        assert_eq!(photo.format, "NEF");
+    }
+    s.execute("edit.redo", &json!({})).unwrap();
+    for photo_id in [id, copy_id] {
+        let photo = s.catalog.photo(photo_id).unwrap();
+        assert_eq!(photo.source, lightcraft_catalog::Source::File { path: out.clone() });
+        assert_eq!(photo.file_size, converted_size);
+        assert_eq!(photo.format, "DNG");
+    }
     assert_eq!(names(), ["shot-2.dng", "shot.dng"], "no temp file left");
     let _ = std::fs::remove_dir_all(&dir);
 }

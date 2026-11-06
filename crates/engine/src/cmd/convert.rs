@@ -58,6 +58,12 @@ pub(crate) fn write_dng_with(file_bytes: Option<&crate::merge::ByteReader>, path
 }
 
 fn convert(s: &mut Session, p: &Value) -> Result<Value> {
+    convert_with_size(s, p, |path| std::fs::metadata(path).map(|metadata| metadata.len()))
+}
+
+/// Convert each target independently; the size reader allows deterministic filesystem-failure tests
+/// after the real DNG write, without process-wide fault injection or timing-dependent races.
+fn convert_with_size(s: &mut Session, p: &Value, read_size: impl Fn(&str) -> std::io::Result<u64>) -> Result<Value> {
     const C: &str = "photo.convertToDng";
     let ids = s.targets(p)?;
     let mut ops = Vec::new();
@@ -86,12 +92,21 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
         match write_dng_for(s, path, packet) {
             Ok(out) => {
                 let file_name = Path::new(&out).file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
-                let file_size = match std::fs::metadata(&out) {
-                    Ok(metadata) => metadata.len(),
-                    Err(error) => return Err(bad(C, format!("{out}: could not read converted file size ({error})"))),
+                let file_size = match read_size(&out) {
+                    Ok(size) => size,
+                    Err(error) => {
+                        let mut reason = format!("{out}: could not read converted file size ({error}); the raw is kept");
+                        if let Err(cleanup) = std::fs::remove_file(&out)
+                            && cleanup.kind() != std::io::ErrorKind::NotFound
+                        {
+                            reason.push_str(&format!("; could not remove unused DNG ({cleanup})"));
+                        }
+                        skipped.push(json!([id.0, reason]));
+                        continue;
+                    }
                 };
-                // virtual copies of this photo follow it to the DNG
-                for c in s.catalog.photos().filter(|c| c.copy_of == Some(id)) {
+                // The original and its virtual copies share the new file, but keep their own metadata.
+                for c in s.catalog.photos().filter(|c| c.copy_of == Some(id)).chain(std::iter::once(&ph)) {
                     ops.push(Op::Relink {
                         id: c.id,
                         file_name: file_name.clone(),
@@ -108,16 +123,6 @@ fn convert(s: &mut Session, p: &Value) -> Result<Value> {
                         preview_checked: c.preview_checked.clone(),
                     });
                 }
-                ops.push(Op::Relink { id, file_name, source: Source::File { path: out.clone() }, format: Some("DNG".into()) });
-                ops.push(Op::SetContent {
-                    id,
-                    width: ph.width,
-                    height: ph.height,
-                    file_size,
-                    content_hash: ph.content_hash.clone(),
-                    preview_only: ph.preview_only.clone(),
-                    preview_checked: ph.preview_checked.clone(),
-                });
                 converted.push(json!({"id": id.0, "path": out, "original": path}));
             }
             Err(e) => skipped.push(json!([id.0, e])),
@@ -428,6 +433,160 @@ pub fn edit_specs() -> Vec<CommandSpec> {
 mod tests {
     use super::*;
     use lightcraft_catalog::{Photo, PhotoId, Source};
+
+    /// Three real synthetic raw files and a virtual copy of each, in an on-disk library.
+    fn conversion_fixture(tag: &str) -> (std::path::PathBuf, Session, Vec<(PhotoId, PhotoId)>) {
+        let dir = crate::tests::xmp::temp_dir(tag);
+        let mut s = Session::new().with_fs();
+        s.open_library(dir.join("library"), false).unwrap();
+        let mut pairs = Vec::new();
+        for name in ["before", "Größe mit Leerzeichen", "after"] {
+            let path = dir.join(format!("{name}.nef"));
+            let mut bytes = crate::tests::xmp::synthetic_dng_with(None, Default::default());
+            bytes.extend_from_slice(&[0; 8192]); // A size difference independent of embedded XMP length.
+            std::fs::write(&path, &bytes).unwrap();
+            let id = s.catalog.alloc_photo_id();
+            let mut photo = Photo::new(id, Source::File { path: path.to_string_lossy().into_owned() }, &format!("{name}.nef"), "NEF", 32, 24, "");
+            photo.kind = MediaKind::Raw;
+            photo.file_size = bytes.len() as u64;
+            s.commit("Fixture", Op::AddPhoto { photo: Box::new(photo) }).unwrap();
+            s.execute("library.select", &json!({"ids": [id.0]})).unwrap();
+            let copy = PhotoId(s.execute("photo.virtualCopy", &json!({})).unwrap()["ids"][0].as_u64().unwrap());
+            s.execute("library.select", &json!({"ids": [copy.0]})).unwrap();
+            s.execute("develop.set", &json!({"control": "light.exposure", "value": 0.75})).unwrap();
+            pairs.push((id, copy));
+        }
+        (dir, s, pairs)
+    }
+
+    /// A post-write size failure skips only its photo, cleans its output, and preserves successful
+    /// conversions on both sides of it, including virtual copies, history and library persistence.
+    #[test]
+    fn convert_to_dng_size_failure_preserves_other_photos() {
+        let (dir, mut s, pairs) = conversion_fixture("dng-size-failure");
+        let before: Vec<_> = pairs.iter().flat_map(|(id, copy)| [*id, *copy]).map(|id| s.catalog.photo(id).unwrap().clone()).collect();
+        let ids: Vec<_> = pairs.iter().map(|(id, _)| id.0).collect();
+        let failed_out = dir.join("Größe mit Leerzeichen.dng");
+        let undo_len = s.undo.len();
+        let r = convert_with_size(&mut s, &json!({"ids": ids}), |path| {
+            assert!(Path::new(path).is_file(), "failure happens after the real DNG write");
+            if Path::new(path) == failed_out {
+                Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "injected metadata failure"))
+            } else {
+                std::fs::metadata(path).map(|m| m.len())
+            }
+        })
+        .unwrap();
+        assert_eq!(r["converted"].as_array().unwrap().len(), 2, "{r}");
+        assert_eq!(r["skipped"].as_array().unwrap().len(), 1, "{r}");
+        assert_eq!(r["skipped"][0][0], pairs[1].0.0);
+        assert!(r["skipped"][0][1].as_str().unwrap().contains("injected metadata failure"));
+        assert!(!failed_out.exists(), "no orphaned DNG");
+        assert_eq!(s.undo.len(), undo_len + 1, "one step for all successful conversions");
+        for old in &before {
+            let now = s.catalog.photo(old.id).unwrap();
+            let Source::File { path } = &old.source else { panic!("file fixture") };
+            assert!(Path::new(path).is_file(), "original kept");
+            if old.id == pairs[1].0 || old.id == pairs[1].1 {
+                assert_eq!(serde_json::to_value(now).unwrap(), serde_json::to_value(old).unwrap(), "failed photo and copy unchanged");
+            } else {
+                let out = Path::new(path).with_extension("dng");
+                let mut expected = (**old).clone();
+                expected.source = Source::File { path: out.to_string_lossy().into_owned() };
+                expected.file_name = out.file_name().unwrap().to_string_lossy().into_owned();
+                expected.format = "DNG".into();
+                expected.file_size = std::fs::metadata(&out).unwrap().len();
+                assert_ne!(expected.file_size, old.file_size);
+                assert_eq!(serde_json::to_value(now).unwrap(), serde_json::to_value(expected).unwrap(), "only source, format, name and size change");
+            }
+        }
+        let converted: Vec<_> = before.iter().map(|ph| s.catalog.photo(ph.id).unwrap().clone()).collect();
+        s.execute("edit.undo", &json!({})).unwrap();
+        for old in &before {
+            assert_eq!(serde_json::to_value(s.catalog.photo(old.id).unwrap()).unwrap(), serde_json::to_value(old).unwrap());
+        }
+        s.execute("edit.redo", &json!({})).unwrap();
+        s.persist().unwrap();
+        drop(s);
+        let mut reopened = Session::new().with_fs();
+        reopened.open_library(dir.join("library"), false).unwrap();
+        for expected in &converted {
+            assert_eq!(serde_json::to_value(reopened.catalog.photo(expected.id).unwrap()).unwrap(), serde_json::to_value(expected).unwrap());
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Saving after Undo must persist the original sizes and paths for originals and virtual copies.
+    #[test]
+    fn convert_to_dng_undone_size_survives_reopen() {
+        let (dir, mut s, pairs) = conversion_fixture("dng-undone-reopen");
+        let before: Vec<_> = s.catalog.photos().cloned().collect();
+        let ids: Vec<_> = pairs.iter().map(|(id, _)| id.0).collect();
+        let r = s.execute("photo.convertToDng", &json!({"ids": ids})).unwrap();
+        assert_eq!(r["converted"].as_array().unwrap().len(), 3);
+        assert_eq!(r["skipped"], json!([]));
+        s.execute("edit.undo", &json!({})).unwrap();
+        s.execute("edit.redo", &json!({})).unwrap();
+        s.execute("edit.undo", &json!({})).unwrap();
+        s.persist().unwrap();
+        drop(s);
+        let mut reopened = Session::new().with_fs();
+        reopened.open_library(dir.join("library"), false).unwrap();
+        for expected in &before {
+            assert_eq!(serde_json::to_value(reopened.catalog.photo(expected.id).unwrap()).unwrap(), serde_json::to_value(expected).unwrap());
+        }
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// If every size lookup fails, the catalog and undo history remain unchanged and no DNG remains.
+    #[test]
+    fn convert_to_dng_all_size_failures_leave_no_step() {
+        let (dir, mut s, pairs) = conversion_fixture("dng-all-size-failures");
+        let before: Vec<_> = s.catalog.photos().map(|ph| serde_json::to_value(ph).unwrap()).collect();
+        let undo_len = s.undo.len();
+        let ids: Vec<_> = pairs.iter().map(|(id, _)| id.0).collect();
+        let r = convert_with_size(&mut s, &json!({"ids": ids}), |_| Err(std::io::Error::other("injected metadata failure"))).unwrap();
+        assert_eq!(r["converted"], json!([]));
+        assert_eq!(r["skipped"].as_array().unwrap().len(), 3);
+        assert_eq!(s.undo.len(), undo_len);
+        assert_eq!(s.catalog.photos().map(|ph| serde_json::to_value(ph).unwrap()).collect::<Vec<_>>(), before);
+        assert!(!std::fs::read_dir(&dir).unwrap().any(|e| e.unwrap().path().extension().is_some_and(|ext| ext == "dng")));
+        drop(s);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A file already removed by another actor needs no cleanup; other cleanup errors are reported
+    /// alongside the metadata failure instead of aborting the remaining conversions.
+    #[test]
+    fn convert_to_dng_size_failure_reports_cleanup_errors() {
+        for replace_with_directory in [false, true] {
+            let (dir, mut s, pairs) = conversion_fixture(if replace_with_directory { "dng-cleanup-error" } else { "dng-already-gone" });
+            let failed_out = dir.join("before.dng");
+            let original = s.catalog.photo(pairs[0].0).unwrap().clone();
+            let r = convert_with_size(&mut s, &json!({"ids": [pairs[0].0.0, pairs[2].0.0]}), |path| {
+                if Path::new(path) == failed_out {
+                    std::fs::remove_file(path).unwrap();
+                    if replace_with_directory {
+                        std::fs::create_dir(path).unwrap();
+                    }
+                    Err(std::io::Error::other("injected metadata failure"))
+                } else {
+                    std::fs::metadata(path).map(|m| m.len())
+                }
+            })
+            .unwrap();
+            assert_eq!(r["converted"].as_array().unwrap().len(), 1);
+            assert_eq!(r["skipped"].as_array().unwrap().len(), 1);
+            let reason = r["skipped"][0][1].as_str().unwrap();
+            assert!(reason.contains("injected metadata failure"));
+            assert_eq!(reason.contains("could not remove unused DNG"), replace_with_directory);
+            assert_eq!(serde_json::to_value(s.catalog.photo(original.id).unwrap()).unwrap(), serde_json::to_value(original).unwrap());
+            drop(s);
+            std::fs::remove_dir_all(dir).unwrap();
+        }
+    }
 
     /// Reload fills camera fields a photo lacks (a CR3 imported before CR3 metadata was read) and keeps
     /// everything already set.
